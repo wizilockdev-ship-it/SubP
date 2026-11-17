@@ -27,8 +27,7 @@ CHANNEL_USERNAME = "@sub_p_work"
 CHANNEL_URL      = "https://t.me/sub_p_work"
 BOT_LINK         = "https://t.me/sub_p_bot"
 
-# ID группы задаётся автоматически через /setgroup, но можно и вписать руками:
-ADMIN_CHAT_ID    = 0                      # сюда запишется после /setgroup
+ADMIN_CHAT_ID    = 0                      # или впиши ID группы, или используй /setgroup
 GROUP_LINK       = "https://t.me/kdskajshsjshshsjalog"
 
 PIARFLOW_API_KEY = "_BCTydDgwlcia7o4gr8aySmIkJ30GYro"
@@ -66,6 +65,12 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
+        # миграция на случай, если ранее колонка была INTEGER
+        try:
+            await conn.execute("ALTER TABLE users ALTER COLUMN user_id TYPE BIGINT;")
+        except Exception:
+            pass
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS earn_tasks (
                 id SERIAL PRIMARY KEY,
@@ -107,13 +112,11 @@ async def set_setting(key: str, value: str):
 
 async def get_or_create_user(user_id, username, first_name, referrer_id=None):
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
-        if not row:
-            await conn.execute(
-                "INSERT INTO users (user_id, username, first_name, referrer_id) VALUES ($1,$2,$3,$4)",
-                user_id, username, first_name, referrer_id)
-            row = await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
-        return row
+        await conn.execute(
+            "INSERT INTO users (user_id, username, first_name, referrer_id) "
+            "VALUES ($1,$2,$3,$4) ON CONFLICT (user_id) DO NOTHING",
+            user_id, username, first_name, referrer_id)
+        return await conn.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
 async def get_balance(user_id):
     async with pool.acquire() as conn:
@@ -154,6 +157,10 @@ async def get_next_task(user_id):
 async def mark_task_done(task_id):
     async with pool.acquire() as conn:
         await conn.execute("UPDATE earn_tasks SET status='done' WHERE id=$1", task_id)
+
+async def mark_task_skipped(task_id):
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE earn_tasks SET status='skipped' WHERE id=$1", task_id)
 
 async def count_pending(user_id):
     async with pool.acquire() as conn:
@@ -240,6 +247,7 @@ def earn_task_kb(link):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Подписаться", url=link)],
         [InlineKeyboardButton(text="✅ Проверить", callback_data="earn_check")],
+        [InlineKeyboardButton(text="⏭ Пропустить задание", callback_data="earn_skip")],
     ])
 
 def cancel_kb():
@@ -304,7 +312,6 @@ async def back_to_menu(cb: CallbackQuery):
 # ==================== КОМАНДА УСТАНОВКИ ГРУППЫ ====================
 @dp.message(Command("setgroup"))
 async def set_group(msg: Message):
-    """Выполнить в группе, куда бот добавлен админом."""
     if msg.chat.type in ("group", "supergroup"):
         await set_setting("admin_chat_id", str(msg.chat.id))
         await msg.answer(
@@ -313,7 +320,6 @@ async def set_group(msg: Message):
             f"Теперь все заказы будут приходить сюда.")
 
 async def get_admin_chat_id():
-    """Получить ID группы: из БД, иначе из конфига."""
     if ADMIN_CHAT_ID:
         return ADMIN_CHAT_ID
     val = await get_setting("admin_chat_id")
@@ -417,6 +423,17 @@ async def earn_check(cb: CallbackQuery):
                     f"Тебе начислено <b>{REFERRAL_REWARD} SP</b>!")
             except Exception:
                 pass
+    await show_next_task(cb)
+
+@dp.callback_query(F.data == "earn_skip")
+async def earn_skip(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    task = await get_next_task(user_id)
+    if not task:
+        await cb.answer("Задание не найдено.", show_alert=True)
+        return
+    await mark_task_skipped(task["id"])
+    await cb.answer("Задание пропущено")
     await show_next_task(cb)
 
 # ==================== БЕСПЛАТНАЯ НАКРУТКА ====================
